@@ -187,7 +187,7 @@ set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
 
 如果是2芯分布式推理，使用如下命令(比如指定在2号和3号芯片上运行, 用`bm-smi`查询芯片id号)：
 ```shell
-./chatglm2 --model chatglm2-6b_f16_2dev.bmodel --dev_id 2,3
+./chatglm2 --model chatglm2-6b_f16_2dev.bmodel --devid 2,3
 ```
 
 ## 编译程序(Python版本)

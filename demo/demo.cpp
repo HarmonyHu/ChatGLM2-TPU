@@ -65,7 +65,7 @@ private:
   const bm_net_info_t *net_blocks_cache[NUM_LAYERS];
   const bm_net_info_t *net_embed;
   const bm_net_info_t *net_lm;
-  bm_tensor_t inputs_embed_512, outputs_embed_512;
+  bm_tensor_t inputs_embed_512;
   bm_tensor_t inputs_lm, outputs_lm;
   bm_tensor_t inputs_pid, next_pid, inputs_attention, next_attention;
   bm_tensor_t past_key[NUM_LAYERS], past_value[NUM_LAYERS];
@@ -73,6 +73,10 @@ private:
   std::string name_lm;
   std::string name_blocks[NUM_LAYERS];
   std::string name_blocks_cache[NUM_LAYERS];
+  bm_tensor_t output_blocks[NUM_LAYERS];
+  bm_tensor_t input0_block;
+  bm_tensor_t output_blocks_cache[NUM_LAYERS];
+  bm_tensor_t input0_block_cache;
   std::string history = "";
   int round = 0;
   int token_length;
@@ -137,10 +141,6 @@ void ChatGLM2::init(const std::vector<int> &devices, std::string model) {
                     net_embed->stages[1].input_shapes[0]);
   assert(true == ret);
 
-  ret = bmrt_tensor(&outputs_embed_512, p_bmrt, net_embed->output_dtypes[0],
-                    net_embed->stages[1].output_shapes[0]);
-  assert(true == ret);
-
   ret = bmrt_tensor(&inputs_pid, p_bmrt, net_blocks[0]->input_dtypes[1],
                     net_blocks[0]->stages[0].input_shapes[1]);
   assert(true == ret);
@@ -165,7 +165,22 @@ void ChatGLM2::init(const std::vector<int> &devices, std::string model) {
     ret = bmrt_tensor(&past_value[i], p_bmrt, net_blocks[0]->output_dtypes[2],
                       net_blocks[0]->stages[0].output_shapes[2]);
     assert(true == ret);
+    bmrt_tensor_with_device(&output_blocks[i],
+                            net_blocks[i]->stages[0].output_mems[0],
+                            net_blocks[i]->output_dtypes[0],
+                            net_blocks[i]->stages[0].output_shapes[0]);
+    bmrt_tensor_with_device(&output_blocks_cache[i],
+                            net_blocks_cache[i]->stages[0].output_mems[0],
+                            net_blocks_cache[i]->output_dtypes[0],
+                            net_blocks_cache[i]->stages[0].output_shapes[0]);
   }
+  bmrt_tensor_with_device(&input0_block, net_blocks[0]->stages[0].input_mems[0],
+                          net_blocks[0]->input_dtypes[0],
+                          net_blocks[0]->stages[0].input_shapes[0]);
+  bmrt_tensor_with_device(&input0_block_cache,
+                          net_blocks_cache[0]->stages[0].input_mems[0],
+                          net_blocks_cache[0]->input_dtypes[0],
+                          net_blocks_cache[0]->stages[0].input_shapes[0]);
   ret = bmrt_tensor(&inputs_lm, p_bmrt, net_lm->input_dtypes[0],
                     net_lm->stages[0].input_shapes[0]);
   assert(true == ret);
@@ -176,7 +191,6 @@ void ChatGLM2::init(const std::vector<int> &devices, std::string model) {
 
 void ChatGLM2::deinit() {
   bm_free_device(bm_handle, inputs_embed_512.device_mem);
-  bm_free_device(bm_handle, outputs_embed_512.device_mem);
   bm_free_device(bm_handle, inputs_lm.device_mem);
   bm_free_device(bm_handle, outputs_lm.device_mem);
   bm_free_device(bm_handle, inputs_pid.device_mem);
@@ -236,32 +250,34 @@ int ChatGLM2::forward_first(std::vector<int> &tokens) {
   }
 
   // forward embeding
-  bm_memcpy_s2d(bm_handle, inputs_embed_512.device_mem, (void *)input_ids.data());
+  bm_memcpy_s2d(bm_handle, inputs_embed_512.device_mem,
+                (void *)input_ids.data());
   auto ret =
       bmrt_launch_tensor_ex(p_bmrt, name_embed.c_str(), &inputs_embed_512, 1,
-                            &outputs_embed_512, 1, true, false);
+                            &input0_block, 1, true, false);
   assert(ret);
   bm_thread_sync(bm_handle);
 
   // forward blocks
   bm_memcpy_s2d(bm_handle, inputs_pid.device_mem, (void *)position_id.data());
-  bm_memcpy_s2d(bm_handle, inputs_attention.device_mem, (void *)attention_mask.data());
-  auto inputs_embed = outputs_embed_512;
-  inputs_embed.shape = net_blocks[0]->stages[0].input_shapes[0];
-  bm_tensor_t inputs_block[3] = {inputs_embed, inputs_pid, inputs_attention};
+  bm_memcpy_s2d(bm_handle, inputs_attention.device_mem,
+                (void *)attention_mask.data());
+  bm_tensor_t inputs_block[3] = {input0_block, inputs_pid, inputs_attention};
   for (int i = 0; i < NUM_LAYERS; i++) {
-    bm_tensor_t outputs_block[3] = {inputs_embed, past_key[i], past_value[i]};
+    bm_tensor_t outputs_block[3] = {output_blocks[i], past_key[i],
+                                    past_value[i]};
     ret = bmrt_launch_tensor_ex(p_bmrt, name_blocks[i].c_str(), inputs_block, 3,
                                 outputs_block, 3, true, false);
     assert(ret);
     bm_thread_sync(bm_handle);
     move2end(past_key[i]);
     move2end(past_value[i]);
+    inputs_block[0] = output_blocks[i];
   }
-  int bytes = inputs_embed.device_mem.size / MAX_LEN;
-  bm_memcpy_d2d_byte(bm_handle, inputs_lm.device_mem, 0,
-                     inputs_embed.device_mem, (token_length - 1) * bytes,
-                     bytes);
+  auto last_output = output_blocks[NUM_LAYERS - 1].device_mem;
+  int bytes = last_output.size / MAX_LEN;
+  bm_memcpy_d2d_byte(bm_handle, inputs_lm.device_mem, 0, last_output,
+                     (token_length - 1) * bytes, bytes);
   ret = bmrt_launch_tensor_ex(p_bmrt, name_lm.c_str(), &inputs_lm, 1,
                               &outputs_lm, 1, true, false);
   bm_thread_sync(bm_handle);
@@ -279,25 +295,26 @@ int ChatGLM2::forward_next() {
   // embedding
   outputs_lm.shape = net_embed->stages[0].input_shapes[0];
   auto ret = bmrt_launch_tensor_ex(p_bmrt, name_embed.c_str(), &outputs_lm, 1,
-                                   &inputs_lm, 1, true, false);
+                                   &input0_block_cache, 1, true, false);
   assert(ret);
   bm_thread_sync(bm_handle);
   // blocks
-  bm_memcpy_s2d(bm_handle, next_attention.device_mem, (void *)attention_mask.data());
+  bm_memcpy_s2d(bm_handle, next_attention.device_mem,
+                (void *)attention_mask.data());
   bm_memcpy_s2d(bm_handle, next_pid.device_mem, (void *)&position_id);
-  auto inputs_embed = inputs_lm;
-  inputs_embed.shape = net_blocks_cache[0]->stages[0].input_shapes[0];
   for (int i = 0; i < NUM_LAYERS; i++) {
-    bm_tensor_t inputs_block[5] = {inputs_embed, next_pid, next_attention,
-                                   past_key[i], past_value[i]};
-    bm_tensor_t outputs_block[3] = {inputs_embed, past_key[i], past_value[i]};
+    bm_tensor_t inputs_block[5] = {
+        i == 0 ? input0_block_cache : output_blocks_cache[i - 1], next_pid,
+        next_attention, past_key[i], past_value[i]};
+    bm_tensor_t outputs_block[3] = {output_blocks_cache[i], past_key[i],
+                                    past_value[i]};
     ret = bmrt_launch_tensor_ex(p_bmrt, name_blocks_cache[i].c_str(),
                                 inputs_block, 5, outputs_block, 3, true, false);
     assert(ret);
     bm_thread_sync(bm_handle);
   }
-  outputs_lm.shape = net_lm->stages[0].output_shapes[0];
-  ret = bmrt_launch_tensor_ex(p_bmrt, name_lm.c_str(), &inputs_lm, 1,
+  ret = bmrt_launch_tensor_ex(p_bmrt, name_lm.c_str(),
+                              &output_blocks_cache[NUM_LAYERS - 1], 1,
                               &outputs_lm, 1, true, false);
   bm_thread_sync(bm_handle);
   int token = 0;
@@ -399,16 +416,25 @@ static std::vector<int> parseCascadeDevices(const std::string &str) {
   return devices;
 }
 
+void Usage() {
+  printf("Usage:\n"
+         "  --help         : Show help info.\n"
+         "  --model        : Set model path \n"
+         "  --devid        : Set devices to run for model, e.g. 1,2. if not "
+         "set, use 0\n");
+}
+
 void processArguments(int argc, char *argv[], std::string &chatglm_model,
                       std::vector<int> &devices) {
   struct option longOptions[] = {{"model", required_argument, nullptr, 'm'},
-                                 {"dev_id", required_argument, nullptr, 'd'},
+                                 {"devid", required_argument, nullptr, 'd'},
+                                 {"help", no_argument, nullptr, 'h'},
                                  {nullptr, 0, nullptr, 0}};
 
   int optionIndex = 0;
   int option;
 
-  while ((option = getopt_long(argc, argv, "m:d:", longOptions,
+  while ((option = getopt_long(argc, argv, "m:d:h:", longOptions,
                                &optionIndex)) != -1) {
     switch (option) {
     case 'm':
@@ -416,6 +442,10 @@ void processArguments(int argc, char *argv[], std::string &chatglm_model,
       break;
     case 'd':
       devices = parseCascadeDevices(optarg);
+      break;
+    case 'h':
+      Usage();
+      exit(EXIT_SUCCESS);
       break;
     case '?':
       exit(EXIT_FAILURE);
